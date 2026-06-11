@@ -44,9 +44,11 @@ Author: Created with Claude (Anthropic)
 License: MIT
 """
 
+import asyncio
 import json
 import os
 import re
+import socket
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -57,12 +59,47 @@ from mcp.types import Tool, TextContent
 from .vivado_session import get_session, VivadoSession
 
 
+def _hw_server_reachable(hw_server_url: str, timeout: float = 1.0) -> bool:
+    """Return True if hw_server is accepting TCP connections at the given URL.
+
+    Vivado's `connect_hw_server` blocks for ~30s trying to reach hw_server if
+    nothing is there, and that hang leaks into the persistent Tcl session —
+    subsequent commands queue behind it and appear to hang forever. A cheap
+    Python-side TCP check lets us bail out before the Vivado call and keep
+    the session clean.
+
+    Accepts URLs in either `TCP:host:port` or `host:port` form.
+    """
+    url = hw_server_url[4:] if hw_server_url.startswith("TCP:") else hw_server_url
+    if ":" not in url:
+        return False
+    host, _, port_s = url.rpartition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.error):
+        return False
+
+
 # =============================================================================
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
-# Feature requests are stored persistently so users can track requested features
-FEATURE_REQUESTS_FILE = Path(__file__).parent / "data" / "feature_requests.json"
+# Feature requests are stored persistently so users can track requested features.
+# Stored under the XDG data dir, NOT the package directory — site-packages is
+# read-only for non-editable installs (and ephemeral under Nix).
+FEATURE_REQUESTS_FILE = (
+    Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    / "vivado_mcp" / "feature_requests.json"
+)
+
+# Legacy location (inside the package) — read as fallback so existing
+# editable installs don't lose previously submitted requests
+_LEGACY_FEATURE_REQUESTS_FILE = Path(__file__).parent / "data" / "feature_requests.json"
 
 # Report management configuration
 # Reports are written to temp files when they exceed inline size limits
@@ -96,11 +133,12 @@ def load_feature_requests() -> list[dict]:
         List of feature request dictionaries, or empty list if file
         doesn't exist or can't be parsed.
     """
-    if FEATURE_REQUESTS_FILE.exists():
-        try:
-            return json.loads(FEATURE_REQUESTS_FILE.read_text())
-        except (json.JSONDecodeError, IOError):
-            return []
+    for path in (FEATURE_REQUESTS_FILE, _LEGACY_FEATURE_REQUESTS_FILE):
+        if path.exists():
+            try:
+                return json.loads(path.read_text())
+            except (json.JSONDecodeError, IOError):
+                continue
     return []
 
 
@@ -339,29 +377,65 @@ def parse_timing_summary(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Parse WNS/TNS (setup timing) using regex
-    # Format: "WNS(ns)      :  1.234" or similar
-    wns_match = re.search(r"WNS\(ns\)\s*:\s*([-\d.]+)", output)
-    tns_match = re.search(r"TNS\(ns\)\s*:\s*([-\d.]+)", output)
-    if wns_match:
-        result["wns"] = float(wns_match.group(1))
-    if tns_match:
-        result["tns"] = float(tns_match.group(1))
+    # Vivado's report_timing_summary prints the metrics in a tabular layout:
+    #
+    #     WNS(ns)   TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints   WHS(ns)   THS(ns)  THS Failing Endpoints  THS Total Endpoints   WPWS(ns)  TPWS(ns)  TPWS Failing Endpoints  TPWS Total Endpoints
+    #     -------   -------  ---------------------  -------------------   -------   -------  ---------------------  -------------------   --------  --------  ----------------------  --------------------
+    #      14.111     0.000                      0                 5688     0.012     0.000                      0                 5688      9.238     0.000                       0                  1752
+    #
+    # We locate the header line, skip the dashed separator, then parse the
+    # first non-empty data row that follows. Twelve tokens are expected:
+    #   WNS, TNS, TNS_fail, TNS_total, WHS, THS, THS_fail, THS_total,
+    #   WPWS, TPWS, TPWS_fail, TPWS_total
+    #
+    # The older "WNS(ns) :  1.234" colon-separated form is still supported as
+    # a fallback for pre-2022 Vivado releases.
+    lines = output.splitlines()
+    header_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"WNS\(ns\)\s+TNS\(ns\)", line):
+            header_idx = i
+            break
 
-    # Parse WHS/THS (hold timing)
-    whs_match = re.search(r"WHS\(ns\)\s*:\s*([-\d.]+)", output)
-    ths_match = re.search(r"THS\(ns\)\s*:\s*([-\d.]+)", output)
-    if whs_match:
-        result["whs"] = float(whs_match.group(1))
-    if ths_match:
-        result["ths"] = float(ths_match.group(1))
+    parsed_table = False
+    if header_idx is not None:
+        # The data row is the first line after the separator that has numeric tokens
+        for j in range(header_idx + 1, min(header_idx + 6, len(lines))):
+            row = lines[j].strip()
+            # Skip the dashed separator row
+            if not row or set(row) <= set("- "):
+                continue
+            tokens = row.split()
+            # Need at least 8 numeric columns to cover setup + hold
+            if len(tokens) >= 8 and re.match(r"^-?\d+\.?\d*$", tokens[0]):
+                try:
+                    result["wns"] = float(tokens[0])
+                    result["tns"] = float(tokens[1])
+                    setup_failing = int(tokens[2])
+                    result["whs"] = float(tokens[4])
+                    result["ths"] = float(tokens[5])
+                    hold_failing = int(tokens[6])
+                    if len(tokens) >= 12:
+                        result["wpws"] = float(tokens[8])
+                        result["tpws"] = float(tokens[9])
+                    # "failing_endpoints" historically reports setup failures
+                    result["failing_endpoints"] = setup_failing + hold_failing
+                    parsed_table = True
+                    break
+                except (ValueError, IndexError):
+                    continue
 
-    # Parse count of failing endpoints
-    fail_match = re.search(r"(\d+)\s+failing\s+endpoint", output, re.IGNORECASE)
-    if fail_match:
-        result["failing_endpoints"] = int(fail_match.group(1))
+    if not parsed_table:
+        # Legacy colon-separated fallback (pre-2022 Vivado)
+        for key in ("wns", "tns", "whs", "ths", "wpws", "tpws"):
+            m = re.search(rf"{key.upper()}\(ns\)\s*:\s*([-\d.]+)", output)
+            if m:
+                result[key] = float(m.group(1))
+        fail_match = re.search(r"(\d+)\s+failing\s+endpoint", output, re.IGNORECASE)
+        if fail_match:
+            result["failing_endpoints"] = int(fail_match.group(1))
 
-    # Determine if timing is met: both setup and hold must have non-negative slack
+    # Timing is met when both setup and hold slacks are non-negative
     if result["wns"] is not None and result["whs"] is not None:
         result["met"] = result["wns"] >= 0 and result["whs"] >= 0
 
@@ -401,15 +475,20 @@ def parse_utilization(output: str) -> dict:
         "raw": output  # Keep raw output for detailed analysis
     }
 
-    # Regex patterns for each resource type
-    # Vivado's table format: "Resource | Used | Fixed | Available | Util%"
-    # Different device families use slightly different names
+    # Regex patterns for each resource type.
+    #
+    # Vivado's table format varies between releases:
+    #   2021 and earlier:  Used | Fixed |              Available | Util%
+    #   2022 and later:    Used | Fixed | Prohibited | Available | Util%
+    #
+    # The optional (?:\s*\d+\.?\d*\s*\|)? group matches the Prohibited column
+    # when present so the same pattern works across versions.
     patterns = {
-        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\s*\|\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
-        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)",
-        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*([\d.]+)"
+        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\.?\d*\s*\|(?:\s*\d+\.?\d*\s*\|)?\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
+        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
+        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)"
     }
 
     # Apply each pattern and extract values
@@ -721,6 +800,114 @@ async def list_tools() -> list[Tool]:
             description="Generate bitstream for the implemented design",
             inputSchema={
                 "type": "object",
+                "properties": {
+                    "jobs": {
+                        "type": "integer",
+                        "description": "Number of parallel jobs (default: 4)"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default: 1800 = 30 minutes). Increase for large designs."
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="launch_run_async",
+            description="Launch a Vivado run (synth_1, impl_1, etc.) without blocking on completion. Use get_run_progress afterwards to poll. Ideal for long impl/bitstream flows that would otherwise freeze the MCP session for 5-15 minutes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run": {
+                        "type": "string",
+                        "description": "Run name (e.g. 'synth_1', 'impl_1')"
+                    },
+                    "jobs": {
+                        "type": "integer",
+                        "description": "Parallel jobs (default 4)"
+                    },
+                    "to_step": {
+                        "type": "string",
+                        "description": "Optional stop-step within the run, e.g. 'write_bitstream' for impl_1 to include bitstream generation"
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Reset and relaunch if the run is already complete or in progress (default false)"
+                    }
+                },
+                "required": ["run"]
+            }
+        ),
+        Tool(
+            name="get_run_progress",
+            description="Poll a Vivado run for its current STATUS and PROGRESS without blocking. Pair with launch_run_async for non-blocking impl/synth/bitstream flows.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run": {
+                        "type": "string",
+                        "description": "Run name (e.g. 'synth_1', 'impl_1')"
+                    }
+                },
+                "required": ["run"]
+            }
+        ),
+
+        # =====================================================================
+        # HARDWARE MANAGER TOOLS
+        # =====================================================================
+        # These tools drive Vivado's hardware manager to program physical
+        # FPGAs over JTAG / USB. hw_server must be reachable (localhost:3121
+        # by default). On Linux, hw_server is usually installed with Vivado
+        # at <vivado>/bin/hw_server and can be launched with `hw_server`
+        # from the terminal if it's not already running.
+
+        Tool(
+            name="list_hw_targets",
+            description="Connect to hw_server and list physical JTAG targets + devices. Use this before programming to confirm the board is visible.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "hw_server_url": {
+                        "type": "string",
+                        "description": "hw_server URL (default: TCP:localhost:3121)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="program_device",
+            description="Program a .bit file onto a physical FPGA via hw_server. This is the last mile: bitstream -> silicon. Safer than raw TCL because it verifies the bitfile exists and runs the full open_hw_manager/connect/program flow in one shot.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "bitfile": {
+                        "type": "string",
+                        "description": "Absolute path to the .bit file to program"
+                    },
+                    "hw_server_url": {
+                        "type": "string",
+                        "description": "hw_server URL (default: TCP:localhost:3121)"
+                    },
+                    "target_index": {
+                        "type": "integer",
+                        "description": "Index into get_hw_targets if multiple are connected (default 0)"
+                    },
+                    "device_index": {
+                        "type": "integer",
+                        "description": "Index of device within the chosen target (default 0 — typically the FPGA; SoCs may have multiple devices on the scan chain)"
+                    }
+                },
+                "required": ["bitfile"]
+            }
+        ),
+        Tool(
+            name="close_hw_manager",
+            description="Close the Vivado hardware manager and disconnect from hw_server. Frees the JTAG cable for other tools.",
+            inputSchema={
+                "type": "object",
                 "properties": {},
                 "required": []
             }
@@ -831,13 +1018,43 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_messages",
-            description="Get synthesis/implementation messages (errors, warnings)",
+            description="Get synthesis/implementation messages (errors, warnings) from a run's log file (runme.log). Use this to diagnose why a run failed. Returns the log path so read_report_section can fetch surrounding context.",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "run": {
+                        "type": "string",
+                        "description": "Run whose log to read (default: 'synth_1'; use 'impl_1' for implementation)"
+                    },
                     "severity": {
                         "type": "string",
                         "description": "Filter by severity: 'all' (default), 'error', 'critical', 'warning'"
+                    },
+                    "max_per_category": {
+                        "type": "integer",
+                        "description": "Cap messages returned per severity category (default: 50)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_drc_violations",
+            description="Run report_drc and return structured violations: rule ID, severity, message, and affected objects. Replaces grepping through the DRC report text.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "severity_filter": {
+                        "type": "string",
+                        "description": "Filter by severity. Comma-separated list of any of: 'error', 'critical_warning', 'warning', 'advisory', 'info'. Default 'all' returns everything."
+                    },
+                    "ruledecks": {
+                        "type": "string",
+                        "description": "Optional ruledeck name to restrict the check (e.g. 'default', 'methodology', 'timing'). Default runs the tool's standard DRC set."
+                    },
+                    "max_violations": {
+                        "type": "integer",
+                        "description": "Cap the number of violations returned (default 500). Prevents the response from exploding on designs with thousands of warnings."
                     }
                 },
                 "required": []
@@ -907,6 +1124,28 @@ async def list_tools() -> list[Tool]:
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of results (default: 100)"
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="check_constraints",
+            description="Audit every top-level port for PACKAGE_PIN and IOSTANDARD assignments. Reports which ports are unconstrained — the condition that triggers UCIO-1 DRC and produces broken bitstreams when DRC is downgraded. Optionally generate a ready-to-edit XDC skeleton for the missing ports.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "generate_skeleton": {
+                        "type": "boolean",
+                        "description": "If true, include an XDC skeleton (as a string) for every unconstrained port. Defaults to false."
+                    },
+                    "skeleton_iostandard": {
+                        "type": "string",
+                        "description": "IOSTANDARD placeholder to emit in the skeleton (default 'LVCMOS18'). Users must still verify this matches their board's bank voltage."
+                    },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Optional path. If set and generate_skeleton is true, the skeleton is also written to this file."
                     }
                 },
                 "required": []
@@ -1268,6 +1507,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """
     Handle tool calls from MCP clients.
 
+    Dispatches to the synchronous implementation in a worker thread so the
+    asyncio event loop stays responsive while long Vivado commands (e.g. a
+    30-minute synthesis) block on pexpect. Without this, a single blocking
+    call would freeze the whole MCP server — no pings, no other requests.
+    """
+    return await asyncio.to_thread(_call_tool_sync, name, arguments)
+
+
+def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
+    """
+    Synchronous tool dispatcher.
+
     This is the main dispatcher that routes tool calls to their implementations.
     Each tool returns a list containing a single TextContent with JSON-formatted
     results.
@@ -1368,7 +1619,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "get_host_status":
         # Get host system status for memory-based server selection
-        import socket
         import psutil
 
         hostname = socket.gethostname()
@@ -1477,11 +1727,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "run_implementation":
         # Run place and route
+        # reset_run is needed to re-launch a previously completed impl_1;
+        # wrapped in catch so a never-launched run doesn't abort the chain
         jobs = arguments.get("jobs", 4)
         timeout = arguments.get("timeout", 3600)  # 60 min default
 
         result = session.run_tcl(
-            f"launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1",
+            f"catch {{reset_run impl_1}}; launch_runs impl_1 -jobs {jobs}; wait_on_run impl_1",
             timeout_override=timeout
         )
 
@@ -1505,11 +1757,260 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     elif name == "generate_bitstream":
         # Generate bitstream (programming file)
-        result = session.run_tcl("launch_runs impl_1 -to_step write_bitstream; wait_on_run impl_1")
+        # If impl_1 already completed route_design, launch_runs resumes from
+        # write_bitstream. The launch is wrapped in catch so an impl_1 that
+        # already wrote its bitstream (relaunch error) still falls through to
+        # the status check, which then reports success.
+        jobs = arguments.get("jobs", 4)
+        timeout = arguments.get("timeout", 1800)  # 30 min default
+
+        result = session.run_tcl(
+            f"catch {{launch_runs impl_1 -to_step write_bitstream -jobs {jobs}}}; "
+            "catch {wait_on_run impl_1}",
+            timeout_override=timeout
+        )
+
+        # Verify actual run status; bitstream success means the run reached
+        # the write_bitstream step, not just any "Complete!" state
+        verification = verify_run_status(session, "impl_1")
+        actual_success = (
+            verification["actually_succeeded"]
+            and "write_bitstream" in verification["status"].lower()
+        )
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": actual_success,
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
+            "run_status": verification["status"],
+            "run_progress": verification["progress"],
+        }, indent=2))]
+
+    elif name == "launch_run_async":
+        # Launch a run without blocking on completion. Vivado's launch_runs
+        # spawns the actual synth/impl as a subprocess and returns quickly
+        # (usually under 5s); the blocking part is the wait_on_run that
+        # run_implementation / run_synthesis normally chain afterwards. By
+        # skipping wait_on_run we hand the session back immediately and let
+        # the caller poll get_run_progress.
+        run_name = arguments.get("run", "").strip()
+        if not run_name:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Missing 'run' argument (e.g. 'synth_1', 'impl_1')"
+            }, indent=2))]
+
+        jobs = int(arguments.get("jobs", 4))
+        to_step = arguments.get("to_step", "").strip()
+        force = bool(arguments.get("force", False))
+
+        cmd_parts = []
+        if force:
+            # reset_runs returns an error if the run hasn't been created yet;
+            # wrap in catch so a fresh project doesn't fail this step.
+            cmd_parts.append(f"catch {{reset_run {run_name}}}")
+        launch = f"launch_runs {run_name} -jobs {jobs}"
+        if to_step:
+            launch += f" -to_step {to_step}"
+        cmd_parts.append(launch)
+        # Immediately query status so the response can tell the caller what
+        # state the run is in right after launch (usually "Queued" or
+        # "Running synth_design").
+        cmd_parts.append(
+            f'puts stdout "LAUNCH_STATUS=[get_property STATUS [get_runs {run_name}]]"'
+        )
+        cmd_parts.append("flush stdout")
+
+        result = session.run_tcl("; ".join(cmd_parts), timeout_override=60)
+
+        # Parse the trailing status line
+        launch_status = ""
+        for line in result.output.splitlines():
+            if line.startswith("LAUNCH_STATUS="):
+                launch_status = line.split("=", 1)[1].strip()
+                break
+
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
+            "run": run_name,
+            "jobs": jobs,
+            "to_step": to_step or None,
+            "launch_status": launch_status,
+            "hint": "Call get_run_progress repeatedly (every 10-30s) to track progress without blocking.",
             "output": result.output,
-            "elapsed_ms": result.elapsed_ms
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "get_run_progress":
+        # Non-blocking progress query. Safe to call at any time; Vivado just
+        # reads the run object's properties without affecting the background
+        # subprocess doing the actual work.
+        run_name = arguments.get("run", "").strip()
+        if not run_name:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Missing 'run' argument"
+            }, indent=2))]
+
+        info = verify_run_status(session, run_name)
+        status_lower = info.get("status", "").lower()
+        finished = (
+            info.get("actually_succeeded", False)
+            or info.get("actually_failed", False)
+            or status_lower.endswith("complete!")
+        )
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "run": run_name,
+            "status": info.get("status"),
+            "progress": info.get("progress"),
+            "finished": finished,
+            "succeeded": info.get("actually_succeeded", False),
+            "failed": info.get("actually_failed", False),
+        }, indent=2))]
+
+    # =========================================================================
+    # HARDWARE MANAGER
+    # =========================================================================
+
+    elif name == "list_hw_targets":
+        # Enumerate physical JTAG targets reachable via hw_server. This opens
+        # the hardware manager if it isn't already open and connects to the
+        # server URL. Safe to call multiple times — Vivado is idempotent here.
+        hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
+
+        # Bail fast if hw_server isn't reachable — Vivado's connect_hw_server
+        # will otherwise hang the entire Tcl session for ~30s and poison
+        # subsequent commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+                "targets_found": 0,
+                "targets": [],
+            }, indent=2))]
+
+        # Run open + connect defensively. If hw_manager is already open or the
+        # connection already exists, Vivado prints a warning but keeps going.
+        # Wrap each step in catch so one prior state doesn't abort the whole
+        # query.
+        probe = (
+            "catch {open_hw_manager}; "
+            f"catch {{connect_hw_server -url {hw_url}}}; "
+            "set __mcp_rows__ [list]; "
+            "foreach __mcp_t__ [get_hw_targets] { "
+            "  set __mcp_devs__ [list]; "
+            "  catch {current_hw_target $__mcp_t__; open_hw_target -quiet}; "
+            "  foreach __mcp_d__ [get_hw_devices] { "
+            "    lappend __mcp_devs__ \"[get_property PART $__mcp_d__]\""
+            "  }; "
+            "  lappend __mcp_rows__ \"$__mcp_t__||[join $__mcp_devs__ ,]\" "
+            "}; "
+            "puts stdout [join $__mcp_rows__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe, timeout_override=30)
+
+        targets = []
+        if result.success and result.output.strip():
+            for line in result.output.splitlines():
+                line = line.strip()
+                if "||" not in line:
+                    continue
+                tname, devs = line.split("||", 1)
+                targets.append({
+                    "target": tname,
+                    "devices": [d for d in devs.split(",") if d],
+                })
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": result.success,
+            "hw_server_url": hw_url,
+            "targets_found": len(targets),
+            "targets": targets,
+            "raw": result.output if not targets else None,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "program_device":
+        # Program a .bit file onto a physical FPGA. This is the terminal
+        # step that takes a verified bitstream and puts it on silicon. We
+        # verify the file exists up front so the agent doesn't spend 5s in
+        # Vivado only to get "file not found" at the last step.
+        bitfile = arguments.get("bitfile", "")
+        if not bitfile or not os.path.isfile(bitfile):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"Bitfile not found: {bitfile}",
+                "hint": "Pass an absolute path to an existing .bit file."
+            }, indent=2))]
+
+        hw_url = arguments.get("hw_server_url", "TCP:localhost:3121")
+        target_idx = int(arguments.get("target_index", 0))
+        device_idx = int(arguments.get("device_index", 0))
+
+        # Fail fast if hw_server isn't accepting connections. Without this
+        # check Vivado's connect_hw_server hangs the session for ~30s and
+        # poisons follow-up commands.
+        if not _hw_server_reachable(hw_url):
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "bitfile": bitfile,
+                "hw_server_url": hw_url,
+                "error": "hw_server not reachable",
+                "hint": "Start hw_server (`<vivado>/bin/hw_server &`) and verify a JTAG cable is connected.",
+            }, indent=2))]
+
+        # Run the whole program flow in one TCL shot so any intermediate
+        # failure (cable disconnected, multiple boards, wrong device) is
+        # caught by a single round-trip. Uses catch to capture the error
+        # message but still report structured output.
+        flow = (
+            "catch {open_hw_manager}; "
+            f"catch {{connect_hw_server -url {hw_url}}}; "
+            "set __mcp_err__ \"\"; "
+            "if {[catch { "
+            f"  set __mcp_tgts__ [get_hw_targets]; "
+            f"  if {{[llength $__mcp_tgts__] == 0}} {{error \"no hw_targets visible — is the cable connected and hw_server running?\"}}; "
+            f"  current_hw_target [lindex $__mcp_tgts__ {target_idx}]; "
+            "  catch {open_hw_target}; "
+            f"  set __mcp_devs__ [get_hw_devices]; "
+            f"  if {{[llength $__mcp_devs__] == 0}} {{error \"no hw_devices on target\"}}; "
+            f"  set __mcp_dev__ [lindex $__mcp_devs__ {device_idx}]; "
+            f"  current_hw_device $__mcp_dev__; "
+            f"  set_property PROGRAM.FILE {{{bitfile}}} $__mcp_dev__; "
+            "  program_hw_devices $__mcp_dev__; "
+            "  refresh_hw_device $__mcp_dev__; "
+            "  puts stdout \"PROGRAMMED $__mcp_dev__\"; "
+            "  flush stdout "
+            "} __mcp_err__]} { "
+            "  puts stdout \"FAILED: $__mcp_err__\"; flush stdout "
+            "}"
+        )
+        result = session.run_tcl(flow, timeout_override=120)
+
+        programmed = "PROGRAMMED" in result.output and "FAILED" not in result.output
+        return [TextContent(type="text", text=json.dumps({
+            "success": programmed,
+            "bitfile": bitfile,
+            "hw_server_url": hw_url,
+            "target_index": target_idx,
+            "device_index": device_idx,
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
+    elif name == "close_hw_manager":
+        # Release the JTAG cable and close the hardware manager so other
+        # tools (e.g. openocd, openFPGALoader, a second Vivado) can use it.
+        result = session.run_tcl("catch {close_hw_target}; catch {disconnect_hw_server}; catch {close_hw_manager}; puts stdout CLOSED; flush stdout")
+        return [TextContent(type="text", text=json.dumps({
+            "success": "CLOSED" in result.output,
+            "output": result.output,
+            "elapsed_ms": result.elapsed_ms,
         }, indent=2))]
 
     # =========================================================================
@@ -1577,7 +2078,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if through:
             cmd += f" -through {{{through}}}"
         if clock:
-            cmd += f" -filter {{CLOCK == {clock}}}"
+            # report_timing has no -filter option; each clock forms a path
+            # group of the same name, so -group restricts to that domain
+            cmd += f" -group {{{clock}}}"
 
         cmd += " -return_string"
         result = session.run_tcl(cmd)
@@ -1691,21 +2194,180 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_messages":
-        # Get Vivado messages filtered by severity
+        # Get synthesis/implementation messages from the run's log file.
+        # There is no TCL command that dumps the message log in -mode tcl
+        # (get_msg_config only manages message *configuration rules*), so we
+        # read runme.log from the run directory instead — that's where
+        # launch_runs writes all ERROR/WARNING/INFO lines.
+        run_name = arguments.get("run", "synth_1")
         severity = arguments.get("severity", "all")
-        result = session.run_tcl("get_msg_config -rules")
-        parsed = parse_messages(result.output)
+        max_per_category = arguments.get("max_per_category", 50)
 
-        # Apply severity filter
+        dir_result = session.run_tcl(f"get_property DIRECTORY [get_runs {{{run_name}}}]")
+        if not dir_result.success or not dir_result.output.strip():
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"Could not resolve directory for run '{run_name}': {dir_result.output}"
+            }, indent=2))]
+
+        log_file = Path(dir_result.output.strip().splitlines()[-1]) / "runme.log"
+        if not log_file.exists():
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"Log file not found: {log_file}. Has the run been launched?",
+                "run": run_name
+            }, indent=2))]
+
+        parsed = parse_messages(log_file.read_text(errors="replace"))
+        parsed.pop("raw", None)
+
+        counts = {
+            "errors": len(parsed["errors"]),
+            "critical_warnings": len(parsed["critical_warnings"]),
+            "warnings": len(parsed["warnings"]),
+            "info": len(parsed["info"])
+        }
+
+        # Apply severity filter, then cap each category to keep responses small
         if severity != "all":
-            filtered = {
-                "error": parsed["errors"],
-                "critical": parsed["critical_warnings"],
-                "warning": parsed["warnings"]
-            }.get(severity, [])
-            parsed = {severity: filtered, "raw": parsed["raw"]}
-        parsed["success"] = result.success
+            key = {
+                "error": "errors",
+                "critical": "critical_warnings",
+                "warning": "warnings"
+            }.get(severity)
+            parsed = {key: parsed[key]} if key else {}
+        for key in list(parsed.keys()):
+            if len(parsed[key]) > max_per_category:
+                parsed[key] = parsed[key][:max_per_category]
+                parsed[f"{key}_truncated"] = True
+
+        parsed["success"] = True
+        parsed["run"] = run_name
+        parsed["counts"] = counts
+        parsed["log_file"] = str(log_file)
+        parsed["hint"] = "Use read_report_section with file_path to read the log around a specific message."
         return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
+
+    elif name == "get_drc_violations":
+        # Run report_drc and return structured violations. Agents routinely
+        # grep through the DRC report text for specific rule IDs; this tool
+        # surfaces that data as JSON so it can be filtered and counted
+        # without parsing.
+        severity_filter = arguments.get("severity_filter", "all").lower().strip()
+        ruledecks = arguments.get("ruledecks", "").strip()
+        max_viol = int(arguments.get("max_violations", 500))
+
+        # Build the report_drc command. Using -name lets us reference the
+        # result set, but the violation objects live directly under
+        # get_drc_violations after report_drc runs.
+        drc_cmd_parts = ["catch {report_drc"]
+        if ruledecks:
+            drc_cmd_parts.append(f"-ruledecks {ruledecks}")
+        drc_cmd_parts.append("-quiet}")
+        drc_cmd = " ".join(drc_cmd_parts)
+
+        # After DRC runs, enumerate violation objects. Escape newlines and
+        # pipes in messages so we can safely parse on the Python side.
+        # drc_violation objects expose NAME (rule name), SEVERITY, DESCRIPTION
+        # (the free-form text), CHECK (check id), CLASS (ruledeck), and ID.
+        # Older docs and other Vivado object types use MESSAGE, but
+        # drc_violation uses DESCRIPTION.
+        probe = (
+            f"{drc_cmd}; "
+            "set __mcp_rows__ [list]; "
+            "foreach __mcp_v__ [get_drc_violations] { "
+            "  set __mcp_nm__ [get_property NAME $__mcp_v__]; "
+            "  set __mcp_sv__ [get_property SEVERITY $__mcp_v__]; "
+            "  set __mcp_msg__ [get_property DESCRIPTION $__mcp_v__]; "
+            "  set __mcp_rule__ \"\"; "
+            "  catch {set __mcp_rule__ [get_property CLASS $__mcp_v__]}; "
+            "  set __mcp_msg__ [string map {\"\\n\" {\\n} | {\\|}} $__mcp_msg__]; "
+            "  set __mcp_sv__ [string map {| {\\|}} $__mcp_sv__]; "
+            "  lappend __mcp_rows__ \"$__mcp_nm__|$__mcp_sv__|$__mcp_rule__|$__mcp_msg__\" "
+            "}; "
+            "puts stdout [join $__mcp_rows__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe, timeout_override=120)
+
+        if not result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "DRC command failed — is a synthesized or opened design in memory?",
+                "output": result.output,
+                "elapsed_ms": result.elapsed_ms,
+            }, indent=2))]
+
+        violations = []
+        counts_by_severity = {}
+        allowed = None
+        if severity_filter != "all":
+            allowed = {s.strip() for s in severity_filter.split(",") if s.strip()}
+
+        def _norm_sev(sev: str) -> str:
+            return sev.lower().replace(" ", "_")
+
+        for line in result.output.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            # Rejoin escaped pipes before splitting
+            # The Tcl string map replaced real `|` with `\|`, so split on the
+            # literal `|` and then unescape each field.
+            raw_fields = line.split("|")
+            # The message may still contain \| markers from the escape — we
+            # splitted too eagerly. Fix: greedy rejoin on first three
+            # unescaped separators; everything else is the message.
+            # Walk the fields and merge any that ended with an odd number of
+            # backslashes (escape was trailing).
+            merged = []
+            buf = ""
+            for f in raw_fields:
+                if buf:
+                    buf = buf + "|" + f
+                else:
+                    buf = f
+                # Count trailing backslashes — odd means escaped pipe
+                trailing = len(buf) - len(buf.rstrip("\\"))
+                if trailing % 2 == 0:
+                    merged.append(buf)
+                    buf = ""
+            if buf:
+                merged.append(buf)
+            fields = merged
+
+            if len(fields) < 4:
+                continue
+            name_f, sev_f, rule_f = fields[0], fields[1], fields[2]
+            msg_f = "|".join(fields[3:])
+            # Unescape the \n, \| placeholders
+            msg_f = msg_f.replace("\\|", "|").replace("\\n", "\n")
+
+            norm_sev = _norm_sev(sev_f)
+            counts_by_severity[norm_sev] = counts_by_severity.get(norm_sev, 0) + 1
+
+            if allowed is not None and norm_sev not in allowed:
+                continue
+            if len(violations) >= max_viol:
+                continue
+
+            violations.append({
+                "rule": name_f,
+                "severity": sev_f,
+                "ruledeck": rule_f,
+                "message": msg_f,
+            })
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "total_violations": sum(counts_by_severity.values()),
+            "by_severity": counts_by_severity,
+            "returned": len(violations),
+            "truncated": sum(counts_by_severity.values()) > len(violations) and allowed is None,
+            "severity_filter": severity_filter,
+            "violations": violations,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
 
     # =========================================================================
     # DESIGN QUERIES
@@ -1730,23 +2392,26 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 if depth <= max_depth:
                     filtered_cells.append(cell)
 
-            # Build a hierarchical structure for easier visualization
-            hierarchy = {}
-            for cell in sorted(filtered_cells):
-                parts = cell.split('/')
-                current = hierarchy
-                for i, part in enumerate(parts):
-                    if part not in current:
-                        current[part] = {"_children": {}}
-                    current = current[part]["_children"]
-
-            # Get module reference for each cell (limited for performance)
+            # Get module reference for each cell in a single TCL round-trip
+            # (limited to 100 cells for response size)
             cell_refs = {}
             sample_cells = filtered_cells[:100]
-            for cell in sample_cells:
-                ref_result = session.run_tcl(f"get_property REF_NAME [get_cells {{{cell}}}]")
-                if ref_result.success and ref_result.output.strip():
-                    cell_refs[cell] = ref_result.output.strip()
+            if sample_cells:
+                cell_list = " ".join(f"{{{c}}}" for c in sample_cells)
+                probe = (
+                    "set __mcp_refs__ [list]; "
+                    f"foreach __mcp_c__ [list {cell_list}] {{ "
+                    "catch {lappend __mcp_refs__ \"$__mcp_c__|[get_property REF_NAME [get_cells $__mcp_c__]]\"} "
+                    "}; "
+                    'puts stdout [join $__mcp_refs__ "\\n"]; flush stdout'
+                )
+                ref_result = session.run_tcl(probe)
+                if ref_result.success:
+                    for line in ref_result.output.splitlines():
+                        if "|" in line:
+                            cell, ref = line.strip().split("|", 1)
+                            if ref:
+                                cell_refs[cell] = ref
 
             response = {
                 "success": True,
@@ -1804,6 +2469,131 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
+    elif name == "check_constraints":
+        # Audit every top-level port for physical pin + iostandard constraints.
+        # This is the gap that UCIO-1 DRC is supposed to close; agents often
+        # downgrade UCIO-1 to warning and ship bitstreams with floating IOs,
+        # which produces random pin mappings on real silicon. We emit a
+        # structured report so the agent can tell the user "N ports are
+        # unconstrained" without waiting for the DRC stage.
+        generate_skeleton = arguments.get("generate_skeleton", False)
+        iostd_default = arguments.get("skeleton_iostandard", "LVCMOS18")
+        output_file = arguments.get("output_file")
+
+        # Collect port metadata in one TCL round-trip. Use a pipe-separated
+        # format so Python can split reliably even on bus ports like
+        # "stimulus_N[0]" whose names contain brackets.
+        #
+        # IS_LOC_FIXED is the authoritative signal for "user XDC set this
+        # pin". After place_design, the placer fills PACKAGE_PIN even for
+        # unconstrained ports, so reading PACKAGE_PIN alone would give a
+        # false positive. IS_LOC_FIXED is 1 iff the user specified LOC.
+        # IOSTANDARD defaults to "DEFAULT" when unspecified — we treat that
+        # literal as missing.
+        probe = (
+            "set __mcp_lines__ [list]; "
+            "foreach __mcp_p__ [get_ports *] { "
+            "  set __mcp_loc_fixed__ 0; "
+            "  catch {set __mcp_loc_fixed__ [get_property IS_LOC_FIXED $__mcp_p__]}; "
+            "  lappend __mcp_lines__ \"$__mcp_p__|"
+            "[get_property DIRECTION $__mcp_p__]|"
+            "[get_property PACKAGE_PIN $__mcp_p__]|"
+            "[get_property IOSTANDARD $__mcp_p__]|"
+            "$__mcp_loc_fixed__\""
+            "}; "
+            "puts stdout [join $__mcp_lines__ \"\\n\"]; "
+            "flush stdout"
+        )
+        result = session.run_tcl(probe)
+        if not result.success:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": "Failed to query ports — is a design open?",
+                "output": result.output,
+                "elapsed_ms": result.elapsed_ms
+            }, indent=2))]
+
+        # Parse the pipe-separated rows back into structured port records.
+        # A port counts as user-constrained only if the LOC was fixed by
+        # the user (IS_LOC_FIXED=1) AND the IOSTANDARD is a real value (not
+        # empty, not the placeholder 'DEFAULT').
+        ports = []
+        unconstrained = []
+        for line in result.output.splitlines():
+            line = line.strip()
+            if not line or "|" not in line:
+                continue
+            parts = line.split("|")
+            if len(parts) < 5:
+                continue
+            port_name, direction, package_pin, iostandard, loc_fixed_s = (
+                parts[0], parts[1], parts[2], parts[3], parts[4]
+            )
+            loc_user_set = loc_fixed_s.strip() in ("1", "true", "TRUE", "yes")
+            iostd_real = bool(iostandard.strip()) and iostandard.strip().upper() != "DEFAULT"
+            pin_present = bool(package_pin.strip())
+
+            record = {
+                "port": port_name,
+                "direction": direction,
+                "package_pin": package_pin,
+                "iostandard": iostandard,
+                "loc_user_set": loc_user_set,
+                "pin_assigned_by_placer": pin_present and not loc_user_set,
+                "constrained": loc_user_set and iostd_real,
+            }
+            ports.append(record)
+            if not record["constrained"]:
+                missing = []
+                if not loc_user_set:
+                    missing.append("PACKAGE_PIN")
+                if not iostd_real:
+                    missing.append("IOSTANDARD")
+                record["missing"] = missing
+                unconstrained.append(record)
+
+        # Build XDC skeleton if requested. One block per unconstrained port,
+        # with a placeholder pin so synth can flag missed edits, and a
+        # user-selectable IOSTANDARD default.
+        skeleton = None
+        if generate_skeleton and unconstrained:
+            lines_out = [
+                "# XDC skeleton generated by vivado-mcp check_constraints",
+                "# Fill in <PIN> values for your target board before synthesis.",
+                "# Verify IOSTANDARD matches the bank voltage of each pin.",
+                "",
+            ]
+            for rec in unconstrained:
+                lines_out.append(f"# Port: {rec['port']}  ({rec['direction']})")
+                if "PACKAGE_PIN" in rec.get("missing", []):
+                    lines_out.append(
+                        f"set_property PACKAGE_PIN <PIN> [get_ports {{{rec['port']}}}]"
+                    )
+                if "IOSTANDARD" in rec.get("missing", []):
+                    lines_out.append(
+                        f"set_property IOSTANDARD {iostd_default} "
+                        f"[get_ports {{{rec['port']}}}]"
+                    )
+                lines_out.append("")
+            skeleton = "\n".join(lines_out)
+            if output_file:
+                try:
+                    with open(output_file, "w") as fh:
+                        fh.write(skeleton)
+                except OSError as exc:
+                    skeleton = f"# Failed to write {output_file}: {exc}\n\n" + skeleton
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "total_ports": len(ports),
+            "constrained": len(ports) - len(unconstrained),
+            "unconstrained": len(unconstrained),
+            "unconstrained_ports": unconstrained,
+            "skeleton": skeleton,
+            "output_file": output_file if (skeleton and output_file) else None,
+            "elapsed_ms": result.elapsed_ms,
+        }, indent=2))]
+
     # =========================================================================
     # RAW TCL
     # =========================================================================
@@ -1812,11 +2602,38 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Execute arbitrary TCL command (escape hatch for advanced users)
         command = arguments.get("command", "")
         result = session.run_tcl(command)
-        return [TextContent(type="text", text=json.dumps({
+
+        # Large outputs (e.g. report_timing -max_paths 1000) would otherwise
+        # blow the context window — truncate and spill the full text to a
+        # report file readable via read_report_section
+        response = {
             "success": result.success,
-            "output": result.output,
             "elapsed_ms": result.elapsed_ms
-        }, indent=2))]
+        }
+        truncated = truncate_response(result.output)
+        response["output"] = truncated["content"]
+        if truncated["truncated"]:
+            ensure_reports_dir()
+            report_id = generate_report_id()
+            spill_path = REPORTS_DIR / f"tcl_{report_id}.txt"
+            try:
+                spill_path.write_text(result.output)
+                _report_cache[report_id] = {
+                    "file_path": str(spill_path),
+                    "report_type": "tcl",
+                    "created": datetime.now().isoformat(),
+                    "size_bytes": len(result.output),
+                    "line_count": truncated["total_lines"]
+                }
+                response["truncated"] = True
+                response["total_chars"] = truncated["total_chars"]
+                response["report_id"] = report_id
+                response["full_output_file"] = str(spill_path)
+                response["hint"] = "Output truncated. Use read_report_section with this report_id for the rest."
+            except OSError:
+                response["truncated"] = True
+                response["total_chars"] = truncated["total_chars"]
+        return [TextContent(type="text", text=json.dumps(response, indent=2))]
 
     # =========================================================================
     # SIMULATION TOOLS
@@ -1826,16 +2643,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Launch Vivado's integrated simulator (xsim)
         mode = arguments.get("mode", "behavioral")
 
-        # Map friendly names to Vivado's mode strings
+        # Map friendly names to Vivado's documented -mode/-type values
+        # (launch_simulation only accepts behavioral / post-synthesis /
+        # post-implementation, with -type functional|timing for the latter two)
         mode_map = {
-            "behavioral": "behav",                    # RTL simulation
-            "post_synth_func": "synth -type func",   # Post-synthesis functional
-            "post_synth_timing": "synth -type timing", # Post-synthesis with timing
-            "post_impl_func": "impl -type func",     # Post-implementation functional
-            "post_impl_timing": "impl -type timing"  # Post-implementation with timing
+            "behavioral": "-mode behavioral",                            # RTL simulation
+            "post_synth_func": "-mode post-synthesis -type functional",
+            "post_synth_timing": "-mode post-synthesis -type timing",
+            "post_impl_func": "-mode post-implementation -type functional",
+            "post_impl_timing": "-mode post-implementation -type timing"
         }
-        sim_mode = mode_map.get(mode, "behav")
-        result = session.run_tcl(f"launch_simulation -mode {sim_mode}")
+        sim_args = mode_map.get(mode, "-mode behavioral")
+        result = session.run_tcl(f"launch_simulation {sim_args}")
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
             "message": result.output if result.output else f"Simulation launched in {mode} mode",
@@ -1924,17 +2743,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "add_signals_to_wave":
-        # Add signals to waveform viewer
+        # Record signals to the simulation waveform database. add_wave only
+        # works in the GUI (it needs a wave window); in -mode tcl the
+        # equivalent is log_wave, which records values to the .wdb file for
+        # later inspection. -r logs the signal and everything below it.
         signals = arguments.get("signals", [])
         if isinstance(signals, str):
             signals = [signals]
         results = []
         for sig in signals:
-            result = session.run_tcl(f"add_wave {{{sig}}}")
+            result = session.run_tcl(f"log_wave -r {{{sig}}}")
             results.append({"signal": sig, "success": result.success})
         return [TextContent(type="text", text=json.dumps({
             "success": all(r["success"] for r in results),
-            "results": results
+            "results": results,
+            "note": "Signals are recorded to the simulation .wdb (log_wave). Logging must be enabled before the time range of interest is simulated."
         }, indent=2))]
 
     elif name == "set_simulation_top":
@@ -2025,17 +2848,43 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         }, indent=2))]
 
     elif name == "get_simulation_messages":
-        # Get simulation log messages
+        # Get simulation log messages from xsim's simulate.log. There is no
+        # TCL command that returns the message log (get_msg_config only
+        # manages configuration rules), so we locate the newest simulate.log
+        # under the project's .sim directory and parse that.
         severity = arguments.get("severity", "all")
-        if severity == "all":
-            result = session.run_tcl("get_msg_config -count")
-        else:
-            result = session.run_tcl(f"get_msg_config -count -severity {{{severity}}}")
-        return [TextContent(type="text", text=json.dumps({
-            "success": result.success,
-            "messages": result.output,
-            "elapsed_ms": result.elapsed_ms
-        }, indent=2))]
+
+        info = session.run_tcl(
+            'puts stdout "[get_property DIRECTORY [current_project]]|[get_property NAME [current_project]]"'
+        )
+        if not info.success or "|" not in info.output:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"Could not resolve project directory: {info.output}"
+            }, indent=2))]
+
+        proj_dir, proj_name = info.output.strip().splitlines()[-1].split("|", 1)
+        sim_dir = Path(proj_dir) / f"{proj_name}.sim"
+        logs = sorted(sim_dir.glob("**/simulate.log"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        if not logs:
+            return [TextContent(type="text", text=json.dumps({
+                "success": False,
+                "error": f"No simulate.log found under {sim_dir}. Has a simulation been launched?"
+            }, indent=2))]
+
+        log_file = logs[0]
+        parsed = parse_messages(log_file.read_text(errors="replace"))
+        parsed.pop("raw", None)
+
+        if severity != "all":
+            key = {"error": "errors", "warning": "warnings", "info": "info"}.get(severity)
+            parsed = {key: parsed[key]} if key else {}
+
+        parsed["success"] = True
+        parsed["log_file"] = str(log_file)
+        parsed["hint"] = "Use read_report_section with file_path to read the full log."
+        return [TextContent(type="text", text=json.dumps(parsed, indent=2))]
 
     # =========================================================================
     # FEATURE REQUESTS
@@ -2095,11 +2944,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             file_path = REPORTS_DIR / f"{report_type}_{report_id}.txt"
 
         # Map report types to Vivado commands
+        # ('hierarchy' uses hierarchical utilization — there is no
+        # report_hierarchy command in Vivado TCL)
         report_commands = {
             "timing": "report_timing -max_paths 100",
             "timing_summary": "report_timing_summary",
             "utilization": "report_utilization",
-            "hierarchy": "report_hierarchy",
+            "hierarchy": "report_utilization -hierarchical",
             "clocks": "report_clocks",
             "power": "report_power",
             "drc": "report_drc"  # Design Rule Check
@@ -2271,5 +3122,4 @@ async def main():
 
 # Allow running directly with: python server.py
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

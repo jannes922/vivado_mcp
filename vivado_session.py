@@ -50,6 +50,7 @@ License: MIT
 import pexpect
 import time
 import re
+import uuid
 from typing import Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -102,12 +103,10 @@ class ErrorClassification:
     Attributes:
         is_tcl_error: True if TCL syntax or runtime error detected
         is_vivado_error: True if Vivado tool error (lines starting with ERROR:)
-        is_report_content: True if output appears to be report/table data
         error_messages: List of actual error message strings found
     """
     is_tcl_error: bool = False
     is_vivado_error: bool = False
-    is_report_content: bool = False
     error_messages: list = field(default_factory=list)
 
     @property
@@ -124,7 +123,6 @@ def classify_output_errors(output: str, command: str) -> ErrorClassification:
     This function performs smart error detection by:
     1. Checking for TCL syntax errors at the START of output
     2. Looking for Vivado errors that START with "ERROR:" (not just contain it)
-    3. Detecting report context (tables, summaries) where "error" is just data
 
     Args:
         output: The raw output from Vivado
@@ -170,23 +168,6 @@ def classify_output_errors(output: str, command: str) -> ErrorClassification:
         if re.match(r'^ERROR:\s*\[', stripped):
             classification.is_vivado_error = True
             classification.error_messages.append(stripped)
-
-    # Detect report context - error strings in tables/summaries don't count as errors
-    # These indicators suggest we're looking at report output, not error messages
-    report_indicators = [
-        'WNS(ns)',           # Timing summary
-        'TNS(ns)',           # Timing summary
-        'WHS(ns)',           # Timing summary
-        '+---------',        # Table borders
-        '|------',           # Table borders
-        '| Site Type',       # Utilization report
-        '| Resource',        # Utilization report
-        'Utilization',       # Utilization report header
-        'Design Timing Summary',
-        'Clock Summary',
-    ]
-    if any(ind in output for ind in report_indicators):
-        classification.is_report_content = True
 
     return classification
 
@@ -411,6 +392,7 @@ class VivadoSession:
         # Serialize command execution with a lock
         with self._lock:
             start_time = time.time()
+            effective_timeout = timeout_override if timeout_override is not None else self.timeout
 
             try:
                 # Clear any pending output from previous commands
@@ -420,46 +402,83 @@ class VivadoSession:
                 except (pexpect.TIMEOUT, pexpect.EOF):
                     pass  # Expected - buffer was empty
 
-                # Send the command to Vivado
+                # Bracket the command with unique sentinel markers so we can
+                # reliably extract output regardless of command length or
+                # whether Vivado wraps the command echo across lines.
+                #
+                # Each marker is sent as its own sendline so a failure in the
+                # user's command doesn't skip the end marker (Tcl aborts a
+                # compound "a; b; c" at the first error, but separate sendlines
+                # are independent statements, each printing Vivado%'s own
+                # prompt afterwards). Using UUIDs makes collisions with actual
+                # output astronomically unlikely.
+                tag = uuid.uuid4().hex[:12]
+                marker_begin = f"__MCP_BEGIN_{tag}__"
+                marker_end = f"__MCP_END_{tag}__"
+
+                self.child.sendline(f'puts stdout "{marker_begin}"; flush stdout')
                 self.child.sendline(command)
+                self.child.sendline(f'puts stdout "{marker_end}"; flush stdout')
 
-                # Wait for the Vivado prompt indicating command completion
-                # The prompt appears after Vivado finishes processing
-                # Use timeout_override if provided (for long operations like synthesis)
-                effective_timeout = timeout_override if timeout_override is not None else self.timeout
-                self.child.expect('Vivado%', timeout=effective_timeout)
+                # Wait for the end marker to appear. We anchor on the marker
+                # followed by a newline so pexpect matches the real stdout
+                # print (marker + \n), not the echoed command line (which has
+                # trailing `"; flush stdout`). Use timeout_override for long
+                # operations like synthesis or impl.
+                self.child.expect(re.escape(marker_end) + r"\s*\r?\n", timeout=effective_timeout)
 
-                # Get everything that was output before the prompt
+                # child.before now contains everything between the send of the
+                # first marker line and the arrival of the end marker. Extract
+                # the region strictly between the two markers.
                 raw_output = self.child.before
 
-                # Parse the output to extract meaningful content
-                # Raw output includes: command echo, actual output, whitespace
-                lines = raw_output.replace('\r', '').split('\n')
-                clean_lines = []
-                found_command = False
+                # The marker appears twice in the buffer: once as the echoed
+                # `puts stdout "marker"` command, once as the actual stdout
+                # line. We want the region after the SECOND occurrence — the
+                # real print — so find the first, then find the next one
+                # after that.
+                first = raw_output.find(marker_begin)
+                second = raw_output.find(marker_begin, first + 1) if first != -1 else -1
+                if second != -1:
+                    region = raw_output[second + len(marker_begin):]
+                elif first != -1:
+                    # Fallback: only one occurrence seen (shouldn't happen,
+                    # but be safe)
+                    region = raw_output[first + len(marker_begin):]
+                else:
+                    region = raw_output
 
-                # Normalize command for matching (handle whitespace differences)
-                cmd_normalized = command.strip()
+                # Clean up: drop prompt lines, command echoes, blank lines.
+                # We keep all real stdout between the markers.
+                lines = region.replace('\r', '').split('\n')
+                clean_lines = []
+                cmd_stripped = command.strip()
+                begin_cmd = f'puts stdout "{marker_begin}"'
+                end_cmd = f'puts stdout "{marker_end}"'
 
                 for line in lines:
                     stripped = line.strip()
-
-                    # Skip lines until we find the echoed command
-                    # Everything before is leftover from previous operations
-                    if not found_command:
-                        if cmd_normalized in stripped:
-                            found_command = True
-                        continue
-
-                    # Skip Vivado prompts in output
-                    if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
-                        continue
-
-                    # Skip empty lines for cleaner output
                     if not stripped:
                         continue
-
+                    # Drop Vivado prompts
+                    if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
+                        continue
+                    # Drop echo of marker commands (Vivado echoes each sendline)
+                    if begin_cmd in stripped or end_cmd in stripped:
+                        continue
+                    # Drop echo of the user's command itself
+                    if stripped == cmd_stripped:
+                        continue
+                    # Also drop Vivado's own command-completion line (empty)
                     clean_lines.append(stripped)
+
+                # After the end marker we may have absorbed a trailing prompt —
+                # swallow the rest of the buffer up to the next Vivado% so the
+                # next run_tcl call starts clean.
+                try:
+                    self.child.expect('Vivado%', timeout=2)
+                except (pexpect.TIMEOUT, pexpect.EOF):
+                    pass
 
                 output = '\n'.join(clean_lines).strip()
 
@@ -497,12 +516,22 @@ class VivadoSession:
                 return result
 
             except pexpect.TIMEOUT:
-                # Command took too long - might be hung or very long operation
+                # Command took too long - might be hung or very long operation.
+                # The command is still running inside Vivado at this point;
+                # without intervention its output would bleed into the next
+                # call's capture and desync every subsequent command. Send
+                # Ctrl-C and resync to the prompt before returning.
                 elapsed = (time.time() - start_time) * 1000
                 self.stats["errors"] += 1
+                resynced = self._interrupt_and_resync()
+                if resynced:
+                    recovery_note = "Sent Ctrl-C and resynced to prompt; session is usable again."
+                else:
+                    recovery_note = ("Could not resync after Ctrl-C; "
+                                     "call check_session_health to restart the session.")
                 return CommandResult(
                     command=command,
-                    output=f"Command timed out after {self.timeout}s",
+                    output=f"Command timed out after {effective_timeout}s. {recovery_note}",
                     return_value="1",
                     success=False,
                     elapsed_ms=elapsed
@@ -518,6 +547,30 @@ class VivadoSession:
                     success=False,
                     elapsed_ms=elapsed
                 )
+
+    def _interrupt_and_resync(self, timeout: float = 10.0) -> bool:
+        """
+        Send Ctrl-C to abort the in-flight command and resync to the prompt.
+
+        Called from the timeout handler while the lock is already held.
+        Returns True if the Vivado prompt was seen again (session usable),
+        False if the session is truly hung or the process died — in that
+        case the caller should restart via ensure_healthy()/stop()+start().
+        """
+        if not self.child:
+            return False
+        try:
+            self.child.sendintr()  # Ctrl-C to the Vivado process
+            self.child.sendline("")
+            self.child.expect('Vivado%', timeout=timeout)
+            # Drain any output the interrupted command still flushed
+            try:
+                self.child.read_nonblocking(size=100000, timeout=0.2)
+            except (pexpect.TIMEOUT, pexpect.EOF):
+                pass
+            return True
+        except (pexpect.TIMEOUT, pexpect.EOF, OSError):
+            return False
 
     def stop(self) -> CommandResult:
         """
@@ -544,6 +597,9 @@ class VivadoSession:
 
         start_time = time.time()
 
+        # Take the lock so we don't shut down mid-command, but don't wait
+        # forever — stop() is also the recovery path for a hung session
+        acquired = self._lock.acquire(timeout=5)
         try:
             # Send exit command for graceful shutdown
             self.child.sendline('exit')
@@ -555,6 +611,9 @@ class VivadoSession:
                 self.child.close(force=True)
             except:
                 pass  # Best effort - process might already be dead
+        finally:
+            if acquired:
+                self._lock.release()
 
         # Update state
         self.is_running = False
@@ -612,6 +671,11 @@ class VivadoSession:
         """
         if not self.is_running or not self.child:
             return False
+        # Don't interleave the probe with a command in flight. If the lock
+        # is held, a command is currently running — the session is busy,
+        # not dead, so report healthy rather than corrupting its output.
+        if not self._lock.acquire(timeout=2):
+            return True
         try:
             # Send a simple command that produces predictable output
             self.child.sendline("puts {HEALTH_OK}")
@@ -620,6 +684,8 @@ class VivadoSession:
             return True
         except (pexpect.TIMEOUT, pexpect.EOF):
             return False
+        finally:
+            self._lock.release()
 
     def ensure_healthy(self) -> CommandResult:
         """

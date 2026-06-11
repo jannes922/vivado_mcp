@@ -28,6 +28,30 @@ cd vivado_mcp
 pip install -e .
 ```
 
+### With Nix
+
+The repo is a flake. Build and run directly:
+
+```bash
+nix run github:coreyhahn/vivado_mcp     # or `nix run .` from a checkout
+nix build .                             # binary at ./result/bin/vivado-mcp
+nix develop                             # dev shell with python + deps + pytest
+nix flake check                         # build + run the unit tests
+```
+
+For the MCP configuration, point the command at the flake:
+
+```json
+{
+  "mcpServers": {
+    "vivado": {
+      "command": "nix",
+      "args": ["run", "github:coreyhahn/vivado_mcp"]
+    }
+  }
+}
+```
+
 ### Configure Claude Code
 
 Add to your Claude Code MCP configuration (`~/.claude/claude_desktop_config.json` or project-level `.mcp.json`):
@@ -79,16 +103,25 @@ Once configured, Claude can interact with Vivado through natural language. Examp
 - `get_project_info` - Get project information (part, directory, etc.)
 
 ### Design Flow
-- `run_synthesis` - Run synthesis
-- `run_implementation` - Run place and route
-- `generate_bitstream` - Generate bitstream
+- `run_synthesis` - Run synthesis (blocking)
+- `run_implementation` - Run place and route (blocking)
+- `generate_bitstream` - Generate bitstream (blocking)
+- `launch_run_async` - Launch any run without blocking; poll with `get_run_progress`
+- `get_run_progress` - Non-blocking STATUS/PROGRESS poll for a run
+
+### Hardware (JTAG)
+- `list_hw_targets` - List JTAG targets/devices via hw_server
+- `program_device` - Program a .bit file onto a connected FPGA
+- `close_hw_manager` - Release the JTAG cable
 
 ### Reports & Analysis
 - `get_timing_summary` - Get timing summary (WNS, TNS, WHS, THS)
 - `get_timing_paths` - Get detailed timing paths for failing/critical paths
 - `get_utilization` - Get resource utilization (LUTs, FFs, BRAMs, DSPs)
 - `get_clocks` - Get clock information
-- `get_messages` - Get synthesis/implementation messages
+- `get_messages` - Get synthesis/implementation messages from a run's log
+- `get_drc_violations` - Run DRC and return structured violations
+- `check_constraints` - Audit top-level ports for user-set PACKAGE_PIN/IOSTANDARD
 
 ### Design Queries
 - `get_design_hierarchy` - Get module/instance hierarchy

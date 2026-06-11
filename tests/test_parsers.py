@@ -129,6 +129,31 @@ def test_utilization_2022_format_with_prohibited_column():
     assert result["io"]["available"] == 360
 
 
+UTILIZATION_2025_POST_SYNTH = """\
++-------------------------+------+-------+------------+-----------+-------+
+|        Site Type        | Used | Fixed | Prohibited | Available | Util% |
++-------------------------+------+-------+------------+-----------+-------+
+| Slice LUTs*             |    1 |     0 |          0 |     53200 | <0.01 |
+|   LUT as Logic          |    1 |     0 |          0 |     53200 | <0.01 |
+| Slice Registers         |   24 |     0 |          0 |    106400 |  0.02 |
+| Block RAM Tile          |    0 |     0 |          0 |       140 |  0.00 |
+| DSPs                    |    0 |     0 |          0 |       220 |  0.00 |
+| Bonded IOB              |    3 |     0 |          0 |       125 |  2.40 |
++-------------------------+------+-------+------------+-----------+-------+
+"""
+
+
+def test_utilization_2025_post_synth_asterisk_and_small_percent():
+    # Real 2025.2 post-synth format: "Slice LUTs*" footnote asterisk and
+    # "<0.01" percentages (verified live — both broke the original regex)
+    result = parse_utilization(UTILIZATION_2025_POST_SYNTH)
+    assert result["lut"]["used"] == 1
+    assert result["lut"]["available"] == 53200
+    assert result["lut"]["percent"] == 0.01
+    assert result["ff"]["used"] == 24
+    assert result["io"]["used"] == 3
+
+
 def test_utilization_empty_output():
     result = parse_utilization("nothing useful")
     assert result["lut"]["used"] == 0
@@ -219,6 +244,17 @@ def test_truncate_long_content():
     # Should end on a line boundary
     assert not result["content"].endswith("lin")
     assert "truncation_message" in result
+
+
+def test_truncate_keep_end():
+    content = "\n".join(f"line {i}" for i in range(1000))
+    result = truncate_response(content, max_chars=500, keep_end=True)
+    assert result["truncated"] is True
+    assert len(result["content"]) <= 500
+    # The end of the content must be preserved (run errors appear last)
+    assert result["content"].endswith("line 999")
+    # Should start on a line boundary
+    assert result["content"].startswith("line ")
 
 
 # ---------------------------------------------------------------------------

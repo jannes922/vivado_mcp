@@ -167,7 +167,8 @@ def save_feature_request(request: dict) -> None:
 # RESPONSE TRUNCATION
 # =============================================================================
 
-def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict:
+def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS,
+                      keep_end: bool = False) -> dict:
     """
     Truncate response content if it exceeds max_chars.
 
@@ -179,6 +180,8 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
     Args:
         content: The full content string to potentially truncate
         max_chars: Maximum characters to return (default: MAX_RESPONSE_CHARS)
+        keep_end: Keep the END of the content instead of the start. Use for
+            run logs, where errors and the final status appear last.
 
     Returns:
         Dictionary with:
@@ -202,17 +205,24 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
             "total_lines": total_lines
         }
 
-    # Truncate to max_chars, but try to end at a line boundary
+    # Truncate to max_chars, but try to cut at a line boundary
     # This makes the output more readable and avoids cutting mid-line
-    truncated_content = content[:max_chars]
-    last_newline = truncated_content.rfind('\n')
-
-    # Only use the newline boundary if we keep >80% of the allowed content
-    # Otherwise we might lose too much useful data
-    if last_newline > max_chars * 0.8:
-        truncated_content = truncated_content[:last_newline]
+    if keep_end:
+        truncated_content = content[-max_chars:]
+        first_newline = truncated_content.find('\n')
+        # Only use the newline boundary if we keep >80% of the allowed content
+        if 0 <= first_newline < max_chars * 0.2:
+            truncated_content = truncated_content[first_newline + 1:]
+    else:
+        truncated_content = content[:max_chars]
+        last_newline = truncated_content.rfind('\n')
+        # Only use the newline boundary if we keep >80% of the allowed content
+        # Otherwise we might lose too much useful data
+        if last_newline > max_chars * 0.8:
+            truncated_content = truncated_content[:last_newline]
 
     truncated_lines = truncated_content.count('\n') + 1
+    cut = "start" if keep_end else "end"
 
     return {
         "content": truncated_content,
@@ -221,8 +231,24 @@ def truncate_response(content: str, max_chars: int = MAX_RESPONSE_CHARS) -> dict
         "total_lines": total_lines,
         "returned_chars": len(truncated_content),
         "returned_lines": truncated_lines,
-        "truncation_message": f"Output truncated ({total_chars:,} chars -> {len(truncated_content):,} chars). Use generate_full_report for complete output."
+        "truncation_message": f"Output truncated at the {cut} ({total_chars:,} chars -> {len(truncated_content):,} chars). Use generate_full_report for complete output."
     }
+
+
+def tail_output(output: str) -> dict:
+    """
+    Tail-truncate a run's console output for inclusion in a response.
+
+    Run outputs (wait_on_run replaying runme.log) can be tens of thousands
+    of characters; the interesting part — errors and the final status — is
+    at the end. Returns {"output": ..., "output_truncated": bool}.
+    """
+    truncated = truncate_response(output, keep_end=True)
+    result = {"output": truncated["content"]}
+    if truncated["truncated"]:
+        result["output_truncated"] = True
+        result["output_total_chars"] = truncated["total_chars"]
+    return result
 
 
 def verify_run_status(session, run_name: str) -> dict:
@@ -484,11 +510,14 @@ def parse_utilization(output: str) -> dict:
     # The optional (?:\s*\d+\.?\d*\s*\|)? group matches the Prohibited column
     # when present so the same pattern works across versions.
     patterns = {
-        "lut": r"(?:Slice LUTs|CLB LUTs)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
-        "ff": r"(?:Slice Registers|CLB Registers)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
-        "bram": r"Block RAM Tile\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\.?\d*\s*\|(?:\s*\d+\.?\d*\s*\|)?\s*(\d+\.?\d*)\s*\|\s*([\d.]+)",
-        "dsp": r"DSPs?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)",
-        "io": r"(?:Bonded IOB|Bonded User I/O)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*([\d.]+)"
+        # Site names may carry a footnote asterisk in post-synth reports
+        # ("Slice LUTs*"), and tiny percentages print as "<0.01" — both are
+        # tolerated (`\*?` / `<?`).
+        "lut": r"(?:Slice LUTs|CLB LUTs)\*?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*<?\s*([\d.]+)",
+        "ff": r"(?:Slice Registers|CLB Registers)\*?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*<?\s*([\d.]+)",
+        "bram": r"Block RAM Tile\*?\s*\|\s*(\d+\.?\d*)\s*\|\s*\d+\.?\d*\s*\|(?:\s*\d+\.?\d*\s*\|)?\s*(\d+\.?\d*)\s*\|\s*<?\s*([\d.]+)",
+        "dsp": r"DSPs?\*?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*<?\s*([\d.]+)",
+        "io": r"(?:Bonded IOB|Bonded User I/O)\*?\s*\|\s*(\d+)\s*\|\s*\d+\s*\|(?:\s*\d+\s*\|)?\s*(\d+)\s*\|\s*<?\s*([\d.]+)"
     }
 
     # Apply each pattern and extract values
@@ -1662,9 +1691,11 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
         result = session.run_tcl(f"open_project {{{project_path}}}")
         if result.success:
             session.current_project = project_path
+        # Tail-truncate: large installs print hundreds of board-part
+        # warnings before the part that matters
         return [TextContent(type="text", text=json.dumps({
             "success": result.success,
-            "output": result.output,
+            **tail_output(result.output),
             "elapsed_ms": result.elapsed_ms
         }, indent=2))]
 
@@ -1713,7 +1744,7 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
 
         response = {
             "success": actual_success,
-            "output": result.output,
+            **tail_output(result.output),
             "elapsed_ms": result.elapsed_ms,
             "run_status": verification["status"],
             "run_progress": verification["progress"],
@@ -1743,7 +1774,7 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
 
         response = {
             "success": actual_success,
-            "output": result.output,
+            **tail_output(result.output),
             "elapsed_ms": result.elapsed_ms,
             "run_status": verification["status"],
             "run_progress": verification["progress"],
@@ -1780,7 +1811,7 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
 
         return [TextContent(type="text", text=json.dumps({
             "success": actual_success,
-            "output": result.output,
+            **tail_output(result.output),
             "elapsed_ms": result.elapsed_ms,
             "run_status": verification["status"],
             "run_progress": verification["progress"],
@@ -2268,10 +2299,10 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
 
         # After DRC runs, enumerate violation objects. Escape newlines and
         # pipes in messages so we can safely parse on the Python side.
-        # drc_violation objects expose NAME (rule name), SEVERITY, DESCRIPTION
-        # (the free-form text), CHECK (check id), CLASS (ruledeck), and ID.
-        # Older docs and other Vivado object types use MESSAGE, but
-        # drc_violation uses DESCRIPTION.
+        # drc_violation objects expose NAME (rule name + instance, e.g.
+        # "NSTD-1#1"), SEVERITY, and DESCRIPTION (the free-form text).
+        # (CLASS just returns the object class string "drc_violation",
+        # verified on 2025.2 — not worth reporting.)
         probe = (
             f"{drc_cmd}; "
             "set __mcp_rows__ [list]; "
@@ -2279,11 +2310,9 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
             "  set __mcp_nm__ [get_property NAME $__mcp_v__]; "
             "  set __mcp_sv__ [get_property SEVERITY $__mcp_v__]; "
             "  set __mcp_msg__ [get_property DESCRIPTION $__mcp_v__]; "
-            "  set __mcp_rule__ \"\"; "
-            "  catch {set __mcp_rule__ [get_property CLASS $__mcp_v__]}; "
             "  set __mcp_msg__ [string map {\"\\n\" {\\n} | {\\|}} $__mcp_msg__]; "
             "  set __mcp_sv__ [string map {| {\\|}} $__mcp_sv__]; "
-            "  lappend __mcp_rows__ \"$__mcp_nm__|$__mcp_sv__|$__mcp_rule__|$__mcp_msg__\" "
+            "  lappend __mcp_rows__ \"$__mcp_nm__|$__mcp_sv__|$__mcp_msg__\" "
             "}; "
             "puts stdout [join $__mcp_rows__ \"\\n\"]; "
             "flush stdout"
@@ -2336,12 +2365,17 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
                 merged.append(buf)
             fields = merged
 
-            if len(fields) < 4:
+            if len(fields) < 3:
                 continue
-            name_f, sev_f, rule_f = fields[0], fields[1], fields[2]
-            msg_f = "|".join(fields[3:])
+            name_f, sev_f = fields[0], fields[1]
+            msg_f = "|".join(fields[2:])
             # Unescape the \n, \| placeholders
             msg_f = msg_f.replace("\\|", "|").replace("\\n", "\n")
+
+            # Sanity-check the rule name (e.g. "NSTD-1#1") so stray console
+            # lines that happen to contain pipes don't become violations
+            if not re.match(r"^[A-Za-z0-9_#.-]+$", name_f):
+                continue
 
             norm_sev = _norm_sev(sev_f)
             counts_by_severity[norm_sev] = counts_by_severity.get(norm_sev, 0) + 1
@@ -2354,7 +2388,6 @@ def _call_tool_sync(name: str, arguments: dict) -> list[TextContent]:
             violations.append({
                 "rule": name_f,
                 "severity": sev_f,
-                "ruledeck": rule_f,
                 "message": msg_f,
             })
 

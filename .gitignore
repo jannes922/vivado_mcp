@@ -29,3 +29,7 @@ Thumbs.db
 # Nix
 result
 result-*
+
+# Local MCP config and xsim artifacts
+.mcp.json
+*.pb

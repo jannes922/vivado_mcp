@@ -278,11 +278,17 @@ class VivadoSession:
             # -mode tcl: Interactive TCL shell (no GUI)
             # -nojournal: Don't create vivado.jou files
             # -nolog: Don't create vivado.log files
+            # dimensions: Vivado's TCL console does its own input echo and
+            # wraps it at the pty width (kernel echo is already off via
+            # echo=False, but that doesn't stop application-level echo).
+            # A very wide pty keeps echoed commands on a single line so
+            # run_tcl's cleanup can reliably filter them out of the output.
             self.child = pexpect.spawn(
                 f'{self.vivado_path} -mode tcl -nojournal -nolog',
                 encoding='utf-8',
                 timeout=self.timeout,
-                echo=False  # Don't echo commands back to us
+                echo=False,  # Don't echo commands back to us (kernel level)
+                dimensions=(100, 8192)
             )
 
             # Wait for Vivado to display its startup banner
@@ -412,13 +418,24 @@ class VivadoSession:
                 # are independent statements, each printing Vivado%'s own
                 # prompt afterwards). Using UUIDs makes collisions with actual
                 # output astronomically unlikely.
+                #
+                # The markers are assembled at runtime with [string cat] so
+                # the *echoed command text* never contains the literal marker.
+                # Vivado's console echoes input asynchronously — an echo can
+                # land in the middle of a long output burst — and if the echo
+                # contained the marker verbatim, expect() could match it early
+                # and silently drop the rest of the output (observed with
+                # outputs >10KB). With string cat, only the real print can
+                # match.
                 tag = uuid.uuid4().hex[:12]
                 marker_begin = f"__MCP_BEGIN_{tag}__"
                 marker_end = f"__MCP_END_{tag}__"
+                begin_cmd = f'puts stdout [string cat {{__MCP_BEGIN_}} {{{tag}__}}]; flush stdout'
+                end_cmd = f'puts stdout [string cat {{__MCP_END_}} {{{tag}__}}]; flush stdout'
 
-                self.child.sendline(f'puts stdout "{marker_begin}"; flush stdout')
+                self.child.sendline(begin_cmd)
                 self.child.sendline(command)
-                self.child.sendline(f'puts stdout "{marker_end}"; flush stdout')
+                self.child.sendline(end_cmd)
 
                 # Wait for the end marker to appear. We anchor on the marker
                 # followed by a newline so pexpect matches the real stdout
@@ -428,48 +445,41 @@ class VivadoSession:
                 self.child.expect(re.escape(marker_end) + r"\s*\r?\n", timeout=effective_timeout)
 
                 # child.before now contains everything between the send of the
-                # first marker line and the arrival of the end marker. Extract
-                # the region strictly between the two markers.
+                # first marker line and the arrival of the end marker. Since
+                # the markers are assembled with [string cat], the echoed
+                # commands never contain them — the first occurrence IS the
+                # real print.
                 raw_output = self.child.before
-
-                # The marker appears twice in the buffer: once as the echoed
-                # `puts stdout "marker"` command, once as the actual stdout
-                # line. We want the region after the SECOND occurrence — the
-                # real print — so find the first, then find the next one
-                # after that.
                 first = raw_output.find(marker_begin)
-                second = raw_output.find(marker_begin, first + 1) if first != -1 else -1
-                if second != -1:
-                    region = raw_output[second + len(marker_begin):]
-                elif first != -1:
-                    # Fallback: only one occurrence seen (shouldn't happen,
-                    # but be safe)
-                    region = raw_output[first + len(marker_begin):]
-                else:
-                    region = raw_output
+                region = raw_output[first + len(marker_begin):] if first != -1 else raw_output
 
-                # Clean up: drop prompt lines, command echoes, blank lines.
-                # We keep all real stdout between the markers.
+                # Clean up: remove command echoes and prompts, keep all real
+                # stdout between the markers.
+                #
+                # Vivado's console echoes each input line asynchronously —
+                # while a command is still streaming output, the echo of the
+                # NEXT queued line can be glued into the middle of an output
+                # line with no newline (observed live with >15KB outputs).
+                # Dropping whole lines that contain echo text would therefore
+                # drop real output; instead, excise the known echo substrings
+                # and keep the rest of the line.
                 lines = region.replace('\r', '').split('\n')
                 clean_lines = []
                 cmd_stripped = command.strip()
-                begin_cmd = f'puts stdout "{marker_begin}"'
-                end_cmd = f'puts stdout "{marker_end}"'
+                echo_strings = [begin_cmd, end_cmd, cmd_stripped]
 
                 for line in lines:
+                    # Excise echoed command text (may appear mid-line, and may
+                    # be redrawn more than once by the console)
+                    for echo in echo_strings:
+                        if echo and echo in line:
+                            line = line.replace(echo, '')
                     stripped = line.strip()
+                    # Drop prompt tokens (possibly stacked: "Vivado% Vivado%")
+                    while stripped.startswith('Vivado%'):
+                        stripped = stripped[len('Vivado%'):].lstrip()
                     if not stripped:
                         continue
-                    # Drop Vivado prompts
-                    if stripped == 'Vivado%' or stripped.startswith('Vivado%'):
-                        continue
-                    # Drop echo of marker commands (Vivado echoes each sendline)
-                    if begin_cmd in stripped or end_cmd in stripped:
-                        continue
-                    # Drop echo of the user's command itself
-                    if stripped == cmd_stripped:
-                        continue
-                    # Also drop Vivado's own command-completion line (empty)
                     clean_lines.append(stripped)
 
                 # After the end marker we may have absorbed a trailing prompt —
@@ -503,9 +513,11 @@ class VivadoSession:
                     elapsed_ms=elapsed
                 )
 
-                # Add to command history (keep last 100 for debugging)
+                # Add to command history (keep last 100 for debugging;
+                # cap command text so session_status stays readable when
+                # long structured probes have been run)
                 self.stats["command_history"].append({
-                    "command": command,
+                    "command": command if len(command) <= 200 else command[:200] + "…",
                     "success": success,
                     "elapsed_ms": elapsed,
                     "timestamp": result.timestamp
